@@ -15,7 +15,7 @@ constexpr int kPinMiso = 19;
 constexpr int kPinMosi = 23;
 constexpr int kPinCs = 5;
 
-// Core1262 control pins.
+// Core1262 control pins. Keep these in sync with PINOUT.md.
 constexpr int kPinReset = 21;
 constexpr int kPinBusy = 2;
 constexpr int kPinDio1 = 15;
@@ -28,9 +28,17 @@ constexpr uint8_t kSpreadingFactor = 9;
 constexpr uint8_t kCodingRate = 7;
 constexpr int8_t kTxPowerDbm = 10;
 constexpr uint16_t kPreambleLength = 8;
-constexpr float kTcxoVoltage = 1.8;
+constexpr float kTcxoVoltage = 1.7;
 
-SX1262 radio = new Module(kPinCs, kPinDio1, kPinReset, kPinBusy);
+// Own the VSPI instance explicitly so RadioLib uses the same SPI bus and pins
+// that PlatformIO/Arduino initializes below.
+SPIClass radioSpi(VSPI);
+SX1262 radio = new Module(
+    kPinCs,
+    kPinDio1,
+    kPinReset,
+    kPinBusy,
+    radioSpi);
 
 void haltOnError(const char* operation, int state) {
   Serial.print(operation);
@@ -45,7 +53,7 @@ void haltOnError(const char* operation, int state) {
 void transmitTestPacket() {
   static uint32_t packetNumber = 1;
 
-  String payload = "ESP32 Core1262 test #" + String(packetNumber++);
+  const String payload = "ESP32 Core1262 test #" + String(packetNumber++);
 
   Serial.print("Transmitting: ");
   Serial.println(payload);
@@ -76,12 +84,10 @@ void setup() {
   Serial.print(kFrequencyMHz, 3);
   Serial.println(" MHz");
 
-  SPI.begin(kPinSck, kPinMiso, kPinMosi, kPinCs);
+  radioSpi.begin(kPinSck, kPinMiso, kPinMosi, kPinCs);
 
-  // The Core1262 uses separate RXEN/TXEN signals for its onboard RF switch.
-  radio.setRfSwitchPins(kPinRxEn, kPinTxEn);
-
-  // DIO3 powers the onboard TCXO. It is wired internally on the Core1262.
+  // Waveshare specifies 1.7 V as the Core1262 TCXO control voltage.
+  // DIO3 is wired to the TCXO internally, so it is not connected to the ESP32.
   radio.tcxoVoltage = kTcxoVoltage;
 
   ConfigLoRa_t config;
@@ -102,6 +108,12 @@ void setup() {
   }
 
   Serial.println("SUCCESS");
+
+  // Core1262 uses the separate RXEN/TXEN pins for its onboard RF switch.
+  // Configure these after radio initialization, as in RadioLib's SX126x
+  // examples. DIO2 is not connected in this project.
+  radio.setRfSwitchPins(kPinRxEn, kPinTxEn);
+
   Serial.println();
   Serial.println("Radio ready.");
   Serial.println("Enter 't' in the serial monitor to transmit a test packet.");
