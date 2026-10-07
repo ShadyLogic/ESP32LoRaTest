@@ -853,15 +853,16 @@ bool ensureFilesystemWriteSpace() {
   size_t total = LittleFS.totalBytes();
   size_t used = LittleFS.usedBytes();
 
-  while (total > used &&
+  while (used >= total ||
          total - used < kMinimumFilesystemFreeBytes) {
     if (!deleteOldestClosedLog()) {
       break;
     }
+    total = LittleFS.totalBytes();
     used = LittleFS.usedBytes();
   }
 
-  return total > used;
+  return used < total;
 }
 
 bool rotateLogIfNeeded() {
