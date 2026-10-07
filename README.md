@@ -55,6 +55,46 @@ For publicly readable MeshCore content it also logs:
 The listener deliberately does not attempt to decrypt direct messages,
 requests, responses, returned paths, or private channels.
 
+## Persistent flash logs
+
+Received packet logs are written to the ESP32 flash using LittleFS as well as
+being printed live over serial. They survive resets and power cycles. Normal
+firmware uploads also leave them intact unless the flash filesystem is erased
+or the partition layout is changed.
+
+Logging uses four rotating files named `/meshcore0.log` through
+`/meshcore3.log`. Each file is limited to 256 KiB, or one-fifth of the
+available LittleFS partition if that is smaller. When the active file reaches
+the limit, the oldest slot is erased and reused. This keeps storage bounded
+and leaves filesystem headroom.
+
+On first use, LittleFS is mounted with format-on-failure enabled so the data
+partition can be initialized automatically.
+
+When a PC is connected, open the serial monitor:
+
+```sh
+pio device monitor
+```
+
+Then enter one of these commands followed by Enter:
+
+```text
+logs
+loginfo
+clearlogs
+help
+```
+
+- `logs` dumps every stored log file in chronological rotation order.
+- `loginfo` reports filesystem usage, each log file size, and the active file.
+- `clearlogs` erases only the MeshCore log files and starts a new log.
+- `help` prints the available commands.
+
+The radio keeps its receive-only configuration. Dumping a large log is a
+blocking serial operation, so packets that arrive while a dump is in progress
+may be missed.
+
 ## Public channel
 
 MeshCore's default Public channel is encrypted on air but uses a documented
@@ -126,6 +166,7 @@ Spreading factor: SF7
 Coding rate: 4/5
 Preamble: 32 symbols
 MeshCore Public channel hash: 0x11
+LittleFS logging enabled: ...
 Initializing SX1262... SUCCESS
 Starting continuous receive... SUCCESS
 Listener is passive. It will not transmit or forward packets.
