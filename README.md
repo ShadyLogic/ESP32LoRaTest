@@ -12,19 +12,16 @@ See [PINOUT.md](PINOUT.md) for the wiring.
 
 The test uses the ESP32 VSPI bus plus these Core1262 control signals:
 
-- RESET: GPIO26
-- BUSY: GPIO27
-- DIO1: GPIO33
+- RESET: GPIO21
+- BUSY: GPIO2
+- DIO1: GPIO15
 - RXEN: GPIO22
 - TXEN: GPIO4
 - DIO2: not connected
-- DIO3: not connected to the ESP32 because it drives the onboard TCXO
+- DIO3: not connected to the ESP32 because it controls the onboard TCXO internally
 
 The Core1262 RF switch is controlled through RXEN and TXEN. The firmware
 hands those pins to RadioLib with `setRfSwitchPins()`.
-
-GPIO1 and GPIO3 are left unused by the radio so UART0 remains available for
-programming and the serial monitor.
 
 ## Before transmitting
 
@@ -44,7 +41,7 @@ The test uses 10 dBm transmit power.
 
 ## Build and upload
 
-This project uses PlatformIO and RadioLib.
+This is a PlatformIO project using the Arduino framework and RadioLib.
 
 From the repository root:
 
@@ -81,6 +78,10 @@ the DIO1 interrupt path worked. It does not by itself prove the RF output or
 antenna path. Use a second compatible LoRa receiver configured with the same
 frequency and modem settings to verify the packet over the air.
 
+If initialization fails, note the RadioLib error number printed after
+`Initialization failed, RadioLib error`. That number is the first thing to
+check when diagnosing SPI, BUSY, RESET, TCXO, or wiring problems.
+
 ## LoRa settings
 
 The smoke test uses:
@@ -98,4 +99,5 @@ The smoke test uses:
 ## References
 
 - Waveshare Core1262 schematic: https://files.waveshare.com/upload/c/c1/CoreSX1262_Sch.pdf
+- Waveshare Core1262 documentation: https://www.waveshare.com/wiki/Core1262-868M
 - RadioLib: https://github.com/jgromes/RadioLib
