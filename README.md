@@ -64,16 +64,20 @@ firmware uploads also leave them intact unless the flash filesystem is erased
 or the partition layout is changed.
 
 The entire LittleFS partition is dedicated to packet logs. Logs are split
-into 64 KiB rotating segments named `/meshcore0.log`,
-`/meshcore1.log`, and so on. At startup the firmware calculates how many
-64 KiB segments the filesystem can hold and uses that many slots. If
-LittleFS metadata overhead makes the theoretical slot count slightly too
-large, the logger discards the oldest closed segment only when additional
-write space is actually required.
+into 64 KiB rotating segments named `/meshcore-0000000000.log`,
+`/meshcore-0000000001.log`, and so on. There is no fixed number of files.
+The logger keeps creating sequential segments for as long as LittleFS has
+space. When more space is required, it deletes only the oldest closed
+segment and continues.
 
 There is no fixed four-file limit and no percentage of LittleFS reserved for
-some other application. Apart from LittleFS filesystem metadata and the
-logger's tiny state file, the partition is dedicated to retained logs.
+another application. A small amount of free space is maintained only as
+working room for LittleFS metadata and writes. The firmware does not use the
+filesystem for anything except these logs.
+
+Upgrading from the earlier four-file logger preserves its existing
+`/meshcore0.log` through `/meshcore3.log` files by migrating them into
+the new sequential naming scheme on first boot.
 
 On first use, LittleFS is mounted with format-on-failure enabled so the data
 partition can be initialized automatically.
@@ -173,7 +177,7 @@ Spreading factor: SF7
 Coding rate: 4/5
 Preamble: 32 symbols
 MeshCore Public channel hash: 0x11
-LittleFS logging enabled: ... bytes used, ... x 64 KiB log slots
+LittleFS logging enabled: ... bytes used, ... existing 64 KiB segments, active=...
 Initializing SX1262... SUCCESS
 Starting continuous receive... SUCCESS
 Listener is passive. It will not transmit or forward packets.
