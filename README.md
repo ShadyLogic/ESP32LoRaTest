@@ -30,7 +30,8 @@ DIO2 is not connected. DIO3 controls the Core1262 TCXO internally.
 For every LoRa packet received with the configured radio profile, the serial
 log includes:
 
-- packet number and ESP32 uptime
+- packet number and 64-bit ESP32 uptime in milliseconds plus
+  `days:hours:minutes:seconds.milliseconds` form
 - packet length
 - RSSI
 - SNR
@@ -62,11 +63,21 @@ being printed live over serial. They survive resets and power cycles. Normal
 firmware uploads also leave them intact unless the flash filesystem is erased
 or the partition layout is changed.
 
-Logging uses four rotating files named `/meshcore0.log` through
-`/meshcore3.log`. Each file is limited to 256 KiB, or one-fifth of the
-available LittleFS partition if that is smaller. When the active file reaches
-the limit, the oldest slot is erased and reused. This keeps storage bounded
-and leaves filesystem headroom.
+The entire LittleFS partition is dedicated to packet logs. Logs are split
+into 64 KiB rotating segments named `/meshcore-0000000000.log`,
+`/meshcore-0000000001.log`, and so on. There is no fixed number of files.
+The logger keeps creating sequential segments for as long as LittleFS has
+space. When more space is required, it deletes only the oldest closed
+segment and continues.
+
+There is no fixed four-file limit and no percentage of LittleFS reserved for
+another application. A small amount of free space is maintained only as
+working room for LittleFS metadata and writes. The firmware does not use the
+filesystem for anything except these logs.
+
+Upgrading from the earlier four-file logger preserves its existing
+`/meshcore0.log` through `/meshcore3.log` files by migrating them into
+the new sequential naming scheme on first boot.
 
 On first use, LittleFS is mounted with format-on-failure enabled so the data
 partition can be initialized automatically.
@@ -166,7 +177,7 @@ Spreading factor: SF7
 Coding rate: 4/5
 Preamble: 32 symbols
 MeshCore Public channel hash: 0x11
-LittleFS logging enabled: ...
+LittleFS logging enabled: ... bytes used, ... existing 64 KiB segments, active=...
 Initializing SX1262... SUCCESS
 Starting continuous receive... SUCCESS
 Listener is passive. It will not transmit or forward packets.
@@ -176,7 +187,7 @@ Example packet logging is similar to:
 
 ```text
 === RX #12 ===
-millis=126391 len=48 rssi_dbm=-91.5 snr_db=7.25 freq_error_hz=-122.0 rx_cr=4/5 crc=yes
+uptime_ms=126391 uptime=0:00:02:06.391 len=48 rssi_dbm=-91.5 snr_db=7.25 freq_error_hz=-122.0 rx_cr=4/5 crc=yes
 raw=...
 mesh_version=1 route=flood payload=group-text(5) hops=2 path_hash_bytes=1
 path=...

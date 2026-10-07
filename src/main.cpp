@@ -4,6 +4,7 @@
 #include <LittleFS.h>
 #include <SHA256.h>
 #include <SPI.h>
+#include <esp_timer.h>
 
 #ifndef MESHCORE_FREQUENCY_MHZ
 #define MESHCORE_FREQUENCY_MHZ 910.525
@@ -75,11 +76,11 @@ constexpr size_t kMaxMeshPathBytes = 64;
 constexpr size_t kCipherMacSize = 2;
 constexpr size_t kAesBlockSize = 16;
 
-// Persistent flash logging. Four rotating files bound storage use and leave
-// filesystem headroom for LittleFS metadata and future needs.
-constexpr uint8_t kLogFileCount = 4;
-constexpr size_t kPreferredLogFileBytes = 256 * 1024;
-constexpr char kLogStatePath[] = "/meshcore.state";
+// Persistent flash logging. The entire LittleFS partition is dedicated to
+// logs. It is divided into as many 64 KiB rotating segments as will fit.
+constexpr size_t kLogSegmentBytes = 64 * 1024;
+constexpr size_t kMinimumFilesystemFreeBytes = 4096;
+constexpr char kLegacyLogStatePath[] = "/meshcore.state";
 constexpr size_t kSerialCommandBufferSize = 32;
 
 // MeshCore's documented default Public channel key.
@@ -105,8 +106,9 @@ uint32_t packetCounter = 0;
 uint8_t publicChannelHash = 0;
 
 bool logStorageReady = false;
-uint8_t activeLogIndex = 0;
-size_t logFileLimitBytes = 0;
+uint32_t activeLogSequence = 0;
+uint32_t oldestLogSequence = 0;
+uint16_t logFileCount = 0;
 File logFile;
 char serialCommandBuffer[kSerialCommandBufferSize] = {};
 size_t serialCommandLength = 0;
@@ -170,6 +172,34 @@ uint32_t readLe32(const uint8_t* p) {
 
 int32_t readLeI32(const uint8_t* p) {
   return static_cast<int32_t>(readLe32(p));
+}
+
+uint64_t uptimeMillis() {
+  return static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+}
+
+void printUptime(Print& out, uint64_t uptimeMs) {
+  const uint32_t millisPart = static_cast<uint32_t>(uptimeMs % 1000ULL);
+  uint64_t totalSeconds = uptimeMs / 1000ULL;
+  const uint32_t seconds = static_cast<uint32_t>(totalSeconds % 60ULL);
+  totalSeconds /= 60ULL;
+  const uint32_t minutes = static_cast<uint32_t>(totalSeconds % 60ULL);
+  totalSeconds /= 60ULL;
+  const uint32_t hours = static_cast<uint32_t>(totalSeconds % 24ULL);
+  const unsigned long long days =
+      static_cast<unsigned long long>(totalSeconds / 24ULL);
+
+  char buffer[40];
+  snprintf(
+      buffer,
+      sizeof(buffer),
+      "%llu:%02u:%02u:%02u.%03u",
+      days,
+      hours,
+      minutes,
+      seconds,
+      millisPart);
+  out.print(buffer);
 }
 
 void printHexByte(Print& out, uint8_t value) {
@@ -614,8 +644,11 @@ void logReceivedPacket(
   out.print(packetCounter);
   out.println(" ===");
 
-  out.print("millis=");
-  out.print(millis());
+  const uint64_t uptimeMs = uptimeMillis();
+  out.print("uptime_ms=");
+  out.print(static_cast<unsigned long long>(uptimeMs));
+  out.print(" uptime=");
+  printUptime(out, uptimeMs);
   out.print(" len=");
   out.print(length);
   out.print(" rssi_dbm=");
@@ -657,39 +690,179 @@ void logReceivedPacket(
   logMeshPacket(out, data, length);
 }
 
-void makeLogPath(uint8_t index, char* path, size_t pathSize) {
-  snprintf(path, pathSize, "/meshcore%u.log", index);
+void makeLogPath(uint32_t sequence, char* path, size_t pathSize) {
+  snprintf(
+      path,
+      pathSize,
+      "/meshcore-%010lu.log",
+      static_cast<unsigned long>(sequence));
 }
 
-bool saveLogState() {
-  File state = LittleFS.open(kLogStatePath, FILE_WRITE);
-  if (!state) {
+bool parseLogPath(const char* path, uint32_t& sequence) {
+  const char* name = strrchr(path, '/');
+  name = name ? name + 1 : path;
+
+  constexpr char kPrefix[] = "meshcore-";
+  constexpr char kSuffix[] = ".log";
+
+  if (strncmp(name, kPrefix, sizeof(kPrefix) - 1) != 0) {
     return false;
   }
-  state.print(activeLogIndex);
-  state.close();
+
+  char* end = nullptr;
+  const unsigned long value =
+      strtoul(name + sizeof(kPrefix) - 1, &end, 10);
+  if (end == nullptr || strcmp(end, kSuffix) != 0) {
+    return false;
+  }
+
+  sequence = static_cast<uint32_t>(value);
   return true;
 }
 
-void loadLogState() {
-  activeLogIndex = 0;
-  File state = LittleFS.open(kLogStatePath, FILE_READ);
-  if (!state) {
+void scanLogFiles() {
+  bool found = false;
+  uint32_t oldest = UINT32_MAX;
+  uint32_t newest = 0;
+  uint16_t count = 0;
+
+  File root = LittleFS.open("/");
+  if (!root) {
+    logFileCount = 0;
+    activeLogSequence = 0;
+    oldestLogSequence = 0;
     return;
   }
 
-  const int value = state.read();
-  state.close();
-  if (value >= '0' && value < '0' + kLogFileCount) {
-    activeLogIndex = static_cast<uint8_t>(value - '0');
+  File entry = root.openNextFile();
+  while (entry) {
+    if (!entry.isDirectory()) {
+      uint32_t sequence = 0;
+      if (parseLogPath(entry.name(), sequence)) {
+        found = true;
+        ++count;
+        if (sequence < oldest) {
+          oldest = sequence;
+        }
+        if (sequence > newest) {
+          newest = sequence;
+        }
+      }
+    }
+    entry.close();
+    entry = root.openNextFile();
+  }
+  root.close();
+
+  logFileCount = count;
+  if (found) {
+    oldestLogSequence = oldest;
+    activeLogSequence = newest;
+  } else {
+    oldestLogSequence = 0;
+    activeLogSequence = 0;
   }
 }
 
+void migrateLegacyLogs() {
+  // The previous logger used /meshcore0.log through /meshcore3.log plus a
+  // one-value state file. Preserve those logs on first boot of this version.
+  scanLogFiles();
+  if (logFileCount != 0) {
+    return;
+  }
+
+  bool hasLegacy = false;
+  uint8_t highestExisting = 0;
+  for (uint8_t i = 0; i < 4; ++i) {
+    char path[24];
+    snprintf(path, sizeof(path), "/meshcore%u.log", i);
+    if (LittleFS.exists(path)) {
+      hasLegacy = true;
+      highestExisting = i;
+    }
+  }
+
+  if (!hasLegacy) {
+    if (LittleFS.exists(kLegacyLogStatePath)) {
+      LittleFS.remove(kLegacyLogStatePath);
+    }
+    return;
+  }
+
+  uint8_t legacyActive = highestExisting;
+  File state = LittleFS.open(kLegacyLogStatePath, FILE_READ);
+  if (state) {
+    const long value = state.parseInt();
+    state.close();
+    if (value >= 0 && value < 4) {
+      legacyActive = static_cast<uint8_t>(value);
+    }
+  }
+
+  uint32_t newSequence = 0;
+  for (uint8_t offset = 1; offset <= 4; ++offset) {
+    const uint8_t index =
+        static_cast<uint8_t>((legacyActive + offset) % 4);
+
+    char oldPath[24];
+    snprintf(oldPath, sizeof(oldPath), "/meshcore%u.log", index);
+    if (!LittleFS.exists(oldPath)) {
+      continue;
+    }
+
+    char newPath[32];
+    makeLogPath(newSequence++, newPath, sizeof(newPath));
+    LittleFS.rename(oldPath, newPath);
+  }
+
+  if (LittleFS.exists(kLegacyLogStatePath)) {
+    LittleFS.remove(kLegacyLogStatePath);
+  }
+
+  scanLogFiles();
+}
+
 bool openActiveLogFile() {
-  char path[24];
-  makeLogPath(activeLogIndex, path, sizeof(path));
+  char path[32];
+  makeLogPath(activeLogSequence, path, sizeof(path));
   logFile = LittleFS.open(path, FILE_APPEND);
   return static_cast<bool>(logFile);
+}
+
+bool deleteOldestClosedLog() {
+  if (logFileCount <= 1 || oldestLogSequence == activeLogSequence) {
+    return false;
+  }
+
+  char path[32];
+  makeLogPath(oldestLogSequence, path, sizeof(path));
+  if (!LittleFS.exists(path) || !LittleFS.remove(path)) {
+    return false;
+  }
+
+  scanLogFiles();
+  return true;
+}
+
+bool ensureFilesystemWriteSpace() {
+  if (!logStorageReady) {
+    return false;
+  }
+
+  size_t total = LittleFS.totalBytes();
+  size_t used = LittleFS.usedBytes();
+
+  while (used >= total ||
+         total - used < kMinimumFilesystemFreeBytes) {
+    if (!deleteOldestClosedLog()) {
+      break;
+    }
+    total = LittleFS.totalBytes();
+    used = LittleFS.usedBytes();
+  }
+
+  return used < total;
 }
 
 bool rotateLogIfNeeded() {
@@ -697,29 +870,41 @@ bool rotateLogIfNeeded() {
     return false;
   }
 
-  if (logFile.size() < logFileLimitBytes) {
-    return true;
+  if (logFile.size() < kLogSegmentBytes) {
+    return ensureFilesystemWriteSpace();
   }
 
   logFile.flush();
   logFile.close();
 
-  activeLogIndex = (activeLogIndex + 1) % kLogFileCount;
+  if (!ensureFilesystemWriteSpace()) {
+    Serial.println("Warning: LittleFS is full and no old log can be removed.");
+  }
 
-  char path[24];
-  makeLogPath(activeLogIndex, path, sizeof(path));
+  ++activeLogSequence;
+  char path[32];
+  makeLogPath(activeLogSequence, path, sizeof(path));
+
   if (LittleFS.exists(path)) {
     LittleFS.remove(path);
   }
 
-  if (!openActiveLogFile()) {
+  logFile = LittleFS.open(path, FILE_WRITE);
+  if (!logFile) {
+    if (deleteOldestClosedLog()) {
+      logFile = LittleFS.open(path, FILE_WRITE);
+    }
+  }
+
+  if (!logFile) {
     logStorageReady = false;
     Serial.println("Persistent logging disabled: log rotation failed.");
     return false;
   }
 
-  if (!saveLogState()) {
-    Serial.println("Warning: could not save log rotation state.");
+  ++logFileCount;
+  if (logFileCount == 1) {
+    oldestLogSequence = activeLogSequence;
   }
 
   logFile.println();
@@ -735,7 +920,9 @@ void writeBootLogHeader() {
 
   logFile.println();
   logFile.println("=== BOOT ===");
-  logFile.print("profile freq_mhz=");
+  logFile.print("uptime_ms=");
+  logFile.print(static_cast<unsigned long long>(uptimeMillis()));
+  logFile.print(" profile freq_mhz=");
   logFile.print(kFrequencyMHz, 3);
   logFile.print(" bw_khz=");
   logFile.print(kBandwidthKHz, 1);
@@ -754,33 +941,38 @@ void beginLogStorage() {
     return;
   }
 
-  const size_t totalBytes = LittleFS.totalBytes();
-  const size_t dynamicLimit =
-      totalBytes > 0 ? totalBytes / (kLogFileCount + 1) : 0;
-  logFileLimitBytes =
-      (dynamicLimit > 0 && dynamicLimit < kPreferredLogFileBytes)
-          ? dynamicLimit
-          : kPreferredLogFileBytes;
+  if (LittleFS.totalBytes() == 0) {
+    Serial.println("LittleFS reports zero capacity. Persistent logging disabled.");
+    return;
+  }
 
-  loadLogState();
+  migrateLegacyLogs();
+  scanLogFiles();
 
-  if (!openActiveLogFile()) {
+  if (logFileCount == 0) {
+    activeLogSequence = 0;
+    oldestLogSequence = 0;
+    if (!openActiveLogFile()) {
+      Serial.println("Could not create persistent log file.");
+      return;
+    }
+    logFileCount = 1;
+  } else if (!openActiveLogFile()) {
     Serial.println("Could not open persistent log file.");
     return;
   }
 
   logStorageReady = true;
-  saveLogState();
+  ensureFilesystemWriteSpace();
 
   Serial.print("LittleFS logging enabled: ");
   Serial.print(LittleFS.usedBytes());
   Serial.print("/");
   Serial.print(LittleFS.totalBytes());
   Serial.print(" bytes used, ");
-  Serial.print(kLogFileCount);
-  Serial.print(" files x ");
-  Serial.print(logFileLimitBytes);
-  Serial.println(" bytes max");
+  Serial.print(logFileCount);
+  Serial.print(" existing 64 KiB segments, active=");
+  Serial.println(activeLogSequence);
 
   writeBootLogHeader();
 }
@@ -795,33 +987,49 @@ void printLogInfo() {
     logFile.flush();
   }
 
+  scanLogFiles();
+
   Serial.print("LittleFS total=");
   Serial.print(LittleFS.totalBytes());
   Serial.print(" used=");
   Serial.print(LittleFS.usedBytes());
-  Serial.print(" per_file_limit=");
-  Serial.println(logFileLimitBytes);
+  Serial.print(" segment_bytes=");
+  Serial.print(kLogSegmentBytes);
+  Serial.print(" files=");
+  Serial.println(logFileCount);
 
-  for (uint8_t i = 0; i < kLogFileCount; ++i) {
-    char path[24];
-    makeLogPath(i, path, sizeof(path));
+  if (logFileCount == 0) {
+    return;
+  }
 
-    Serial.print(path);
-    if (LittleFS.exists(path)) {
-      File file = LittleFS.open(path, FILE_READ);
-      Serial.print(" size=");
-      Serial.print(file ? file.size() : 0);
-      if (file) {
-        file.close();
+  for (uint32_t sequence = oldestLogSequence;
+       sequence <= activeLogSequence;
+       ++sequence) {
+    char path[32];
+    makeLogPath(sequence, path, sizeof(path));
+    if (!LittleFS.exists(path)) {
+      if (sequence == UINT32_MAX) {
+        break;
       }
-    } else {
-      Serial.print(" missing");
+      continue;
     }
 
-    if (i == activeLogIndex) {
+    File file = LittleFS.open(path, FILE_READ);
+    Serial.print(path);
+    Serial.print(" size=");
+    Serial.print(file ? file.size() : 0);
+    if (file) {
+      file.close();
+    }
+
+    if (sequence == activeLogSequence) {
       Serial.print(" active");
     }
     Serial.println();
+
+    if (sequence == UINT32_MAX) {
+      break;
+    }
   }
 }
 
@@ -835,47 +1043,46 @@ void dumpLogs() {
     logFile.flush();
   }
 
+  scanLogFiles();
   Serial.println("=== LOG DUMP BEGIN ===");
 
-  // Oldest file is immediately after the active file in the ring. Missing
-  // files are skipped, so this also works before all four slots are used.
-  for (uint8_t offset = 1; offset <= kLogFileCount; ++offset) {
-    const uint8_t index =
-        (activeLogIndex + offset) % kLogFileCount;
-    char path[24];
-    makeLogPath(index, path, sizeof(path));
+  if (logFileCount > 0) {
+    for (uint32_t sequence = oldestLogSequence;
+         sequence <= activeLogSequence;
+         ++sequence) {
+      char path[32];
+      makeLogPath(sequence, path, sizeof(path));
 
-    if (!LittleFS.exists(path)) {
-      continue;
-    }
+      if (LittleFS.exists(path)) {
+        File file = LittleFS.open(path, FILE_READ);
+        if (!file) {
+          Serial.print("--- failed to open ");
+          Serial.print(path);
+          Serial.println(" ---");
+        } else {
+          Serial.print("--- ");
+          Serial.print(path);
+          Serial.print(" (");
+          Serial.print(file.size());
+          Serial.println(" bytes) ---");
 
-    File file = LittleFS.open(path, FILE_READ);
-    if (!file) {
-      Serial.print("--- failed to open ");
-      Serial.print(path);
-      Serial.println(" ---");
-      continue;
-    }
+          uint8_t buffer[128];
+          while (file.available()) {
+            const size_t count = file.read(buffer, sizeof(buffer));
+            if (count == 0) {
+              break;
+            }
+            Serial.write(buffer, count);
+            delay(0);
+          }
+          file.close();
+          Serial.println();
+        }
+      }
 
-    Serial.print("--- ");
-    Serial.print(path);
-    Serial.print(" (");
-    Serial.print(file.size());
-    Serial.println(" bytes) ---");
-
-    uint8_t buffer[128];
-    while (file.available()) {
-      const size_t count = file.read(buffer, sizeof(buffer));
-      if (count == 0) {
+      if (sequence == UINT32_MAX) {
         break;
       }
-      Serial.write(buffer, count);
-      delay(0);
-    }
-    file.close();
-
-    if (Serial.availableForWrite() > 0) {
-      Serial.println();
     }
   }
 
@@ -892,26 +1099,45 @@ void clearLogs() {
     logFile.close();
   }
 
-  for (uint8_t i = 0; i < kLogFileCount; ++i) {
+  scanLogFiles();
+  if (logFileCount > 0) {
+    for (uint32_t sequence = oldestLogSequence;
+         sequence <= activeLogSequence;
+         ++sequence) {
+      char path[32];
+      makeLogPath(sequence, path, sizeof(path));
+      if (LittleFS.exists(path)) {
+        LittleFS.remove(path);
+      }
+      if (sequence == UINT32_MAX) {
+        break;
+      }
+    }
+  }
+
+  // Clean up files from the previous four-slot logger too.
+  for (uint8_t i = 0; i < 4; ++i) {
     char path[24];
-    makeLogPath(i, path, sizeof(path));
+    snprintf(path, sizeof(path), "/meshcore%u.log", i);
     if (LittleFS.exists(path)) {
       LittleFS.remove(path);
     }
   }
-
-  if (LittleFS.exists(kLogStatePath)) {
-    LittleFS.remove(kLogStatePath);
+  if (LittleFS.exists(kLegacyLogStatePath)) {
+    LittleFS.remove(kLegacyLogStatePath);
   }
 
-  activeLogIndex = 0;
+  activeLogSequence = 0;
+  oldestLogSequence = 0;
+  logFileCount = 0;
+
   if (!openActiveLogFile()) {
     logStorageReady = false;
-    Serial.println("Logs cleared, but the active log could not be reopened.");
+    Serial.println("Logs cleared, but a new log could not be created.");
     return;
   }
 
-  saveLogState();
+  logFileCount = 1;
   writeBootLogHeader();
   Serial.println("Persistent logs cleared.");
 }
