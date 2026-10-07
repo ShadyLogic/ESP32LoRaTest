@@ -53,7 +53,7 @@ void haltOnError(const char* operation, int state) {
 void transmitTestPacket() {
   static uint32_t packetNumber = 1;
 
-  const String payload = "ESP32 Core1262 test #" + String(packetNumber++);
+  String payload = "ESP32 Core1262 test #" + String(packetNumber++);
 
   Serial.print("Transmitting: ");
   Serial.println(payload);
