@@ -586,8 +586,14 @@ void logReceivedPacket(uint8_t* data, size_t length, int state) {
   Serial.print(frequencyError, 1);
 
   if (headerState == RADIOLIB_ERR_NONE) {
-    Serial.print(" rx_cr=4/");
-    Serial.print(rxCodingRate);
+    Serial.print(" rx_cr=");
+    if (rxCodingRate >= 1 && rxCodingRate <= 4) {
+      Serial.print("4/");
+      Serial.print(rxCodingRate + 4);
+    } else {
+      Serial.print("raw:");
+      Serial.print(rxCodingRate);
+    }
     Serial.print(" crc=");
     Serial.print(rxHasCrc ? "yes" : "no");
   }
