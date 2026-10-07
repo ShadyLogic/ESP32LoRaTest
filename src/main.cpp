@@ -766,37 +766,64 @@ void scanLogFiles() {
 
 void migrateLegacyLogs() {
   // The previous logger used /meshcore0.log through /meshcore3.log plus a
-  // one-value state file. Preserve those logs on first boot of this version.
+  // one-value state file. Detect those names by enumerating the directory so
+  // missing legacy files do not generate noisy VFS open errors.
   scanLogFiles();
   if (logFileCount != 0) {
     return;
   }
 
+  bool legacyPresent[4] = {false, false, false, false};
+  bool legacyStatePresent = false;
   bool hasLegacy = false;
   uint8_t highestExisting = 0;
-  for (uint8_t i = 0; i < 4; ++i) {
-    char path[24];
-    snprintf(path, sizeof(path), "/meshcore%u.log", i);
-    if (LittleFS.exists(path)) {
-      hasLegacy = true;
-      highestExisting = i;
+
+  File root = LittleFS.open("/");
+  if (root) {
+    File entry = root.openNextFile();
+    while (entry) {
+      if (!entry.isDirectory()) {
+        const char* name = entry.name();
+        const char* base = strrchr(name, '/');
+        base = base ? base + 1 : name;
+
+        if (strcmp(base, "meshcore.state") == 0) {
+          legacyStatePresent = true;
+        } else {
+          for (uint8_t i = 0; i < 4; ++i) {
+            char legacyName[20];
+            snprintf(legacyName, sizeof(legacyName), "meshcore%u.log", i);
+            if (strcmp(base, legacyName) == 0) {
+              legacyPresent[i] = true;
+              hasLegacy = true;
+              highestExisting = i;
+              break;
+            }
+          }
+        }
+      }
+      entry.close();
+      entry = root.openNextFile();
     }
+    root.close();
   }
 
   if (!hasLegacy) {
-    if (LittleFS.exists(kLegacyLogStatePath)) {
+    if (legacyStatePresent) {
       LittleFS.remove(kLegacyLogStatePath);
     }
     return;
   }
 
   uint8_t legacyActive = highestExisting;
-  File state = LittleFS.open(kLegacyLogStatePath, FILE_READ);
-  if (state) {
-    const long value = state.parseInt();
-    state.close();
-    if (value >= 0 && value < 4) {
-      legacyActive = static_cast<uint8_t>(value);
+  if (legacyStatePresent) {
+    File state = LittleFS.open(kLegacyLogStatePath, FILE_READ);
+    if (state) {
+      const long value = state.parseInt();
+      state.close();
+      if (value >= 0 && value < 4) {
+        legacyActive = static_cast<uint8_t>(value);
+      }
     }
   }
 
@@ -804,19 +831,19 @@ void migrateLegacyLogs() {
   for (uint8_t offset = 1; offset <= 4; ++offset) {
     const uint8_t index =
         static_cast<uint8_t>((legacyActive + offset) % 4);
+    if (!legacyPresent[index]) {
+      continue;
+    }
 
     char oldPath[24];
     snprintf(oldPath, sizeof(oldPath), "/meshcore%u.log", index);
-    if (!LittleFS.exists(oldPath)) {
-      continue;
-    }
 
     char newPath[32];
     makeLogPath(newSequence++, newPath, sizeof(newPath));
     LittleFS.rename(oldPath, newPath);
   }
 
-  if (LittleFS.exists(kLegacyLogStatePath)) {
+  if (legacyStatePresent) {
     LittleFS.remove(kLegacyLogStatePath);
   }
 
@@ -1115,17 +1142,14 @@ void clearLogs() {
     }
   }
 
-  // Clean up files from the previous four-slot logger too.
+  // Clean up files from the previous four-slot logger too. remove() is safe
+  // for absent paths and avoids the noisy read-open performed by exists().
   for (uint8_t i = 0; i < 4; ++i) {
     char path[24];
     snprintf(path, sizeof(path), "/meshcore%u.log", i);
-    if (LittleFS.exists(path)) {
-      LittleFS.remove(path);
-    }
+    LittleFS.remove(path);
   }
-  if (LittleFS.exists(kLegacyLogStatePath)) {
-    LittleFS.remove(kLegacyLogStatePath);
-  }
+  LittleFS.remove(kLegacyLogStatePath);
 
   activeLogSequence = 0;
   oldestLogSequence = 0;
