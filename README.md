@@ -12,39 +12,26 @@ See [PINOUT.md](PINOUT.md) for the wiring.
 
 The test uses the ESP32 VSPI bus plus these Core1262 control signals:
 
-- RESET: GPIO26
-- BUSY: GPIO27
-- DIO1: GPIO33
+- RESET: GPIO21
+- BUSY: GPIO2
+- DIO1: GPIO15
 - RXEN: GPIO22
 - TXEN: GPIO4
 - DIO2: not connected
-- DIO3: not connected to the ESP32 because it drives the onboard TCXO
+- DIO3: not connected to the ESP32 because it controls the onboard TCXO internally
 
 The Core1262 RF switch is controlled through RXEN and TXEN. The firmware
-hands those pins to RadioLib with `setRfSwitchPins()`.
+hands those pins to RadioLib with `setRfSwitchPins()` after the SX1262 has
+initialized.
 
-GPIO1 and GPIO3 are left unused by the radio so UART0 remains available for
-programming and the serial monitor.
+## PlatformIO
 
-## Before transmitting
+The project pins its build dependencies so a future PlatformIO or RadioLib
+release does not silently change the test environment:
 
-Connect an antenna that matches the frequency range of your Core1262 module
-before transmitting.
-
-The PlatformIO configuration defaults to 915 MHz:
-
-```ini
--D LORA_FREQUENCY_MHZ=915.0
-```
-
-Change that value in `platformio.ini` to a frequency supported by your
-physical Core1262 variant and permitted for your location before testing.
-
-The test uses 10 dBm transmit power.
-
-## Build and upload
-
-This project uses PlatformIO and RadioLib.
+- PlatformIO Espressif 32 platform: 7.1.3
+- RadioLib: 7.8.1
+- Framework: Arduino
 
 From the repository root:
 
@@ -55,6 +42,29 @@ pio device monitor
 ```
 
 The serial monitor runs at 115200 baud.
+
+If you previously built the project with different dependency versions, clean
+the project first:
+
+```sh
+pio run --target clean
+pio run
+```
+
+## Frequency
+
+The PlatformIO configuration currently sets:
+
+```ini
+-D LORA_FREQUENCY_MHZ=915.0
+```
+
+Change that value in `platformio.ini` if 915 MHz is not supported by your
+physical Core1262 variant or is not appropriate for your location.
+
+Connect a matching antenna before transmitting.
+
+## Expected output
 
 On a successful startup you should see output similar to:
 
@@ -68,8 +78,7 @@ Radio ready.
 Enter 't' in the serial monitor to transmit a test packet.
 ```
 
-Enter `t` in the serial monitor to transmit a packet. A successful local
-transmit should report:
+Enter `t` in the serial monitor to transmit a packet:
 
 ```text
 Transmitting: ESP32 Core1262 test #1
@@ -81,9 +90,16 @@ the DIO1 interrupt path worked. It does not by itself prove the RF output or
 antenna path. Use a second compatible LoRa receiver configured with the same
 frequency and modem settings to verify the packet over the air.
 
-## LoRa settings
+If initialization fails, note the RadioLib error number printed after:
 
-The smoke test uses:
+```text
+Initialization failed, RadioLib error ...
+```
+
+That error number is useful for distinguishing SPI/wiring failures from TCXO
+or radio-configuration failures.
+
+## LoRa settings
 
 | Setting | Value |
 | --- | --- |
@@ -93,9 +109,10 @@ The smoke test uses:
 | Sync word | RadioLib private LoRa sync word |
 | TX power | 10 dBm |
 | Preamble | 8 symbols |
-| TCXO voltage | 1.8 V |
+| TCXO control voltage | 1.7 V |
 
 ## References
 
 - Waveshare Core1262 schematic: https://files.waveshare.com/upload/c/c1/CoreSX1262_Sch.pdf
+- Waveshare Core1262 documentation: https://www.waveshare.com/wiki/Core1262-868M
 - RadioLib: https://github.com/jgromes/RadioLib
