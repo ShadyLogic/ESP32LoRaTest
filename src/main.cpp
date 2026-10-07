@@ -16,9 +16,9 @@ constexpr int kPinMosi = 23;
 constexpr int kPinCs = 5;
 
 // Core1262 control pins.
-constexpr int kPinReset = 26;
-constexpr int kPinBusy = 27;
-constexpr int kPinDio1 = 33;
+constexpr int kPinReset = 21;
+constexpr int kPinBusy = 2;
+constexpr int kPinDio1 = 15;
 constexpr int kPinRxEn = 22;
 constexpr int kPinTxEn = 4;
 
