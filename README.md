@@ -1,39 +1,151 @@
 # ESP32LoRaTest
 
-Simple smoke test for an ESP32-DevKit-C connected to a Waveshare Core1262
-LoRa module.
+Passive MeshCore receiver for an ESP32-DevKit-C connected to a Waveshare
+Core1262 (SX1262) LoRa module.
 
-The test verifies that the ESP32 can initialize the SX1262 over SPI and
-transmit a LoRa packet on command.
+The firmware does not transmit. It listens for MeshCore packets, logs radio
+metadata and MeshCore header information, and decodes information that is
+publicly readable.
 
 ## Hardware
 
-See [PINOUT.md](PINOUT.md) for the wiring.
+The wiring remains in [PINOUT.md](PINOUT.md):
 
-The test uses the ESP32 VSPI bus plus these Core1262 control signals:
+| Core1262 | ESP32-DevKit-C |
+| --- | --- |
+| MISO | GPIO19 |
+| MOSI | GPIO23 |
+| CLK | GPIO18 |
+| CS | GPIO5 |
+| RESET | GPIO21 |
+| BUSY | GPIO2 |
+| DIO1 | GPIO15 |
+| RXEN | GPIO22 |
+| TXEN | GPIO4 |
 
-- RESET: GPIO21
-- BUSY: GPIO2
-- DIO1: GPIO15
-- RXEN: GPIO22
-- TXEN: GPIO4
-- DIO2: not connected
-- DIO3: not connected to the ESP32 because it controls the onboard TCXO internally
+DIO2 is not connected. DIO3 controls the Core1262 TCXO internally.
 
-The Core1262 RF switch is controlled through RXEN and TXEN. The firmware
-hands those pins to RadioLib with `setRfSwitchPins()` after the SX1262 has
-initialized.
+## What the listener logs
 
-## PlatformIO
+For every LoRa packet received with the configured radio profile, the serial
+log includes:
 
-The project pins its build dependencies so a future PlatformIO or RadioLib
-release does not silently change the test environment:
+- packet number and ESP32 uptime
+- packet length
+- RSSI
+- SNR
+- SX1262 frequency-error estimate
+- received LoRa coding rate and CRC presence when available
+- full raw packet bytes in hexadecimal
+- MeshCore payload version
+- route type
+- payload type
+- hop count and path-hash size
+- transport codes, when present
+- route path bytes
 
-- PlatformIO Espressif 32 platform: 7.1.3
-- RadioLib: 7.8.1
-- Framework: Arduino
+For publicly readable MeshCore content it also logs:
 
-From the repository root:
+- default Public channel text messages
+- default Public channel datagrams
+- node advertisements, including public-key prefix, timestamp, advertised
+  node type, optional location, and name
+- control-packet subtype
+
+The listener deliberately does not attempt to decrypt direct messages,
+requests, responses, returned paths, or private channels.
+
+## Persistent flash logs
+
+Received packet logs are written to the ESP32 flash using LittleFS as well as
+being printed live over serial. They survive resets and power cycles. Normal
+firmware uploads also leave them intact unless the flash filesystem is erased
+or the partition layout is changed.
+
+Logging uses four rotating files named `/meshcore0.log` through
+`/meshcore3.log`. Each file is limited to 256 KiB, or one-fifth of the
+available LittleFS partition if that is smaller. When the active file reaches
+the limit, the oldest slot is erased and reused. This keeps storage bounded
+and leaves filesystem headroom.
+
+On first use, LittleFS is mounted with format-on-failure enabled so the data
+partition can be initialized automatically.
+
+When a PC is connected, open the serial monitor:
+
+```sh
+pio device monitor
+```
+
+Then enter one of these commands followed by Enter:
+
+```text
+logs
+loginfo
+clearlogs
+help
+```
+
+- `logs` dumps every stored log file in chronological rotation order.
+- `loginfo` reports filesystem usage, each log file size, and the active file.
+- `clearlogs` erases only the MeshCore log files and starts a new log.
+- `help` prints the available commands.
+
+The radio keeps its receive-only configuration. Dumping a large log is a
+blocking serial operation, so packets that arrive while a dump is in progress
+may be missed.
+
+## Public channel
+
+MeshCore's default Public channel is encrypted on air but uses a documented
+shared key intended to be known by everyone:
+
+```text
+8b3387e9c5cdea6ac9e5edbaa115cd72
+```
+
+This firmware implements the same AES-128 + truncated HMAC-SHA256 processing
+used by MeshCore and will decode packets whose channel hash matches that key.
+
+MeshCore group messages do not cryptographically authenticate the sender
+name. The displayed `name: message` text should therefore be treated as
+unverified.
+
+Hashtag channels are also intended to be publicly discoverable by people who
+know the hashtag, but their keys are derived from the hashtag name. A passive
+listener cannot recover arbitrary unknown hashtag names from the one-byte
+channel hash, so this firmware does not try to brute-force them.
+
+## Radio profile
+
+MeshCore networks must use matching frequency, bandwidth, spreading factor,
+coding rate, and sync word. There is no single worldwide MeshCore frequency.
+
+The PlatformIO project currently defaults to the MeshCore USA/Canada narrow
+profile:
+
+| Setting | Value |
+| --- | --- |
+| Frequency | 910.525 MHz |
+| Bandwidth | 62.5 kHz |
+| Spreading factor | SF7 |
+| Coding rate | 4/5 |
+| LoRa sync word | private / 0x12 |
+| Preamble | 32 symbols |
+
+The profile is configured in `platformio.ini`:
+
+```ini
+-D MESHCORE_FREQUENCY_MHZ=910.525
+-D MESHCORE_BANDWIDTH_KHZ=62.5
+-D MESHCORE_SPREADING_FACTOR=7
+-D MESHCORE_CODING_RATE=5
+```
+
+Change these values to the preset used by the MeshCore network you want to
+monitor.
+
+## Build and run
 
 ```sh
 pio run
@@ -43,76 +155,58 @@ pio device monitor
 
 The serial monitor runs at 115200 baud.
 
-If you previously built the project with different dependency versions, clean
-the project first:
-
-```sh
-pio run --target clean
-pio run
-```
-
-## Frequency
-
-The PlatformIO configuration currently sets:
-
-```ini
--D LORA_FREQUENCY_MHZ=915.0
-```
-
-Change that value in `platformio.ini` if 915 MHz is not supported by your
-physical Core1262 variant or is not appropriate for your location.
-
-Connect a matching antenna before transmitting.
-
-## Expected output
-
-On a successful startup you should see output similar to:
+A normal startup looks like:
 
 ```text
-ESP32-DevKit-C + Waveshare Core1262 test
-----------------------------------------
-Frequency: 915.000 MHz
+ESP32 + Core1262 MeshCore passive listener
+-----------------------------------------
+Frequency: 910.525 MHz
+Bandwidth: 62.5 kHz
+Spreading factor: SF7
+Coding rate: 4/5
+Preamble: 32 symbols
+MeshCore Public channel hash: 0x11
+LittleFS logging enabled: ...
 Initializing SX1262... SUCCESS
-
-Radio ready.
-Enter 't' in the serial monitor to transmit a test packet.
+Starting continuous receive... SUCCESS
+Listener is passive. It will not transmit or forward packets.
 ```
 
-Enter `t` in the serial monitor to transmit a packet:
+Example packet logging is similar to:
 
 ```text
-Transmitting: ESP32 Core1262 test #1
-Transmit SUCCESS
+=== RX #12 ===
+millis=126391 len=48 rssi_dbm=-91.5 snr_db=7.25 freq_error_hz=-122.0 rx_cr=4/5 crc=yes
+raw=...
+mesh_version=1 route=flood payload=group-text(5) hops=2 path_hash_bytes=1
+path=...
+PUBLIC timestamp=... text_type=0 attempt=0 text="node-name: hello"
+note=MeshCore group sender names are unverified message text
 ```
 
-A successful transmit means the SX1262 completed its transmit operation and
-the DIO1 interrupt path worked. It does not by itself prove the RF output or
-antenna path. Use a second compatible LoRa receiver configured with the same
-frequency and modem settings to verify the packet over the air.
+## Notes
 
-If initialization fails, note the RadioLib error number printed after:
+The SX1262 frequency-error value is useful as a diagnostic, but RadioLib notes
+that this measurement is based on an undocumented SX126x behavior, so it
+should be treated as an estimate.
 
-```text
-Initialization failed, RadioLib error ...
-```
+Advertisements contain an Ed25519 signature. This listener currently logs
+advertisement contents but does not verify that signature, and marks them
+accordingly.
 
-That error number is useful for distinguishing SPI/wiring failures from TCXO
-or radio-configuration failures.
-
-## LoRa settings
-
-| Setting | Value |
-| --- | --- |
-| Bandwidth | 125 kHz |
-| Spreading factor | 9 |
-| Coding rate | 4/7 |
-| Sync word | RadioLib private LoRa sync word |
-| TX power | 10 dBm |
-| Preamble | 8 symbols |
-| TCXO control voltage | 1.7 V |
+Duplicate MeshCore packets are intentionally not suppressed. A flooded packet
+may arrive more than once over different paths, and retaining each reception
+preserves its individual RSSI/SNR/path information.
 
 ## References
 
-- Waveshare Core1262 schematic: https://files.waveshare.com/upload/c/c1/CoreSX1262_Sch.pdf
-- Waveshare Core1262 documentation: https://www.waveshare.com/wiki/Core1262-868M
-- RadioLib: https://github.com/jgromes/RadioLib
+- MeshCore packet format:
+  https://github.com/meshcore-dev/MeshCore/blob/main/docs/packet_format.md
+- MeshCore payload format:
+  https://github.com/meshcore-dev/MeshCore/blob/main/docs/payloads.md
+- MeshCore radio presets:
+  https://github.com/meshcore-dev/MeshCore/blob/main/docs/radio_presets.md
+- MeshCore public-channel documentation:
+  https://github.com/meshcore-dev/MeshCore/blob/main/docs/companion_protocol.md
+- RadioLib:
+  https://github.com/jgromes/RadioLib
