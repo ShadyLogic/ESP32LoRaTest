@@ -766,37 +766,64 @@ void scanLogFiles() {
 
 void migrateLegacyLogs() {
   // The previous logger used /meshcore0.log through /meshcore3.log plus a
-  // one-value state file. Preserve those logs on first boot of this version.
+  // one-value state file. Detect those names by enumerating the directory so
+  // missing legacy files do not generate noisy VFS open errors.
   scanLogFiles();
   if (logFileCount != 0) {
     return;
   }
 
+  bool legacyPresent[4] = {false, false, false, false};
+  bool legacyStatePresent = false;
   bool hasLegacy = false;
   uint8_t highestExisting = 0;
-  for (uint8_t i = 0; i < 4; ++i) {
-    char path[24];
-    snprintf(path, sizeof(path), "/meshcore%u.log", i);
-    if (LittleFS.exists(path)) {
-      hasLegacy = true;
-      highestExisting = i;
+
+  File root = LittleFS.open("/");
+  if (root) {
+    File entry = root.openNextFile();
+    while (entry) {
+      if (!entry.isDirectory()) {
+        const char* name = entry.name();
+        const char* base = strrchr(name, '/');
+        base = base ? base + 1 : name;
+
+        if (strcmp(base, "meshcore.state") == 0) {
+          legacyStatePresent = true;
+        } else {
+          for (uint8_t i = 0; i < 4; ++i) {
+            char legacyName[20];
+            snprintf(legacyName, sizeof(legacyName), "meshcore%u.log", i);
+            if (strcmp(base, legacyName) == 0) {
+              legacyPresent[i] = true;
+              hasLegacy = true;
+              highestExisting = i;
+              break;
+            }
+          }
+        }
+      }
+      entry.close();
+      entry = root.openNextFile();
     }
+    root.close();
   }
 
   if (!hasLegacy) {
-    if (LittleFS.exists(kLegacyLogStatePath)) {
+    if (legacyStatePresent) {
       LittleFS.remove(kLegacyLogStatePath);
     }
     return;
   }
 
   uint8_t legacyActive = highestExisting;
-  File state = LittleFS.open(kLegacyLogStatePath, FILE_READ);
-  if (state) {
-    const long value = state.parseInt();
-    state.close();
-    if (value >= 0 && value < 4) {
-      legacyActive = static_cast<uint8_t>(value);
+  if (legacyStatePresent) {
+    File state = LittleFS.open(kLegacyLogStatePath, FILE_READ);
+    if (state) {
+      const long value = state.parseInt();
+      state.close();
+      if (value >= 0 && value < 4) {
+        legacyActive = static_cast<uint8_t>(value);
+      }
     }
   }
 
@@ -804,19 +831,19 @@ void migrateLegacyLogs() {
   for (uint8_t offset = 1; offset <= 4; ++offset) {
     const uint8_t index =
         static_cast<uint8_t>((legacyActive + offset) % 4);
+    if (!legacyPresent[index]) {
+      continue;
+    }
 
     char oldPath[24];
     snprintf(oldPath, sizeof(oldPath), "/meshcore%u.log", index);
-    if (!LittleFS.exists(oldPath)) {
-      continue;
-    }
 
     char newPath[32];
     makeLogPath(newSequence++, newPath, sizeof(newPath));
     LittleFS.rename(oldPath, newPath);
   }
 
-  if (LittleFS.exists(kLegacyLogStatePath)) {
+  if (legacyStatePresent) {
     LittleFS.remove(kLegacyLogStatePath);
   }
 
@@ -837,7 +864,7 @@ bool deleteOldestClosedLog() {
 
   char path[32];
   makeLogPath(oldestLogSequence, path, sizeof(path));
-  if (!LittleFS.exists(path) || !LittleFS.remove(path)) {
+  if (!LittleFS.remove(path)) {
     return false;
   }
 
@@ -885,9 +912,9 @@ bool rotateLogIfNeeded() {
   char path[32];
   makeLogPath(activeLogSequence, path, sizeof(path));
 
-  if (LittleFS.exists(path)) {
-    LittleFS.remove(path);
-  }
+  // Sequence numbers are monotonic, so this path should be new. Remove it
+  // defensively without probing first to avoid noisy VFS read-open errors.
+  LittleFS.remove(path);
 
   logFile = LittleFS.open(path, FILE_WRITE);
   if (!logFile) {
@@ -1007,12 +1034,6 @@ void printLogInfo() {
        ++sequence) {
     char path[32];
     makeLogPath(sequence, path, sizeof(path));
-    if (!LittleFS.exists(path)) {
-      if (sequence == UINT32_MAX) {
-        break;
-      }
-      continue;
-    }
 
     File file = LittleFS.open(path, FILE_READ);
     Serial.print(path);
@@ -1053,31 +1074,29 @@ void dumpLogs() {
       char path[32];
       makeLogPath(sequence, path, sizeof(path));
 
-      if (LittleFS.exists(path)) {
-        File file = LittleFS.open(path, FILE_READ);
-        if (!file) {
-          Serial.print("--- failed to open ");
-          Serial.print(path);
-          Serial.println(" ---");
-        } else {
-          Serial.print("--- ");
-          Serial.print(path);
-          Serial.print(" (");
-          Serial.print(file.size());
-          Serial.println(" bytes) ---");
+      File file = LittleFS.open(path, FILE_READ);
+      if (!file) {
+        Serial.print("--- failed to open ");
+        Serial.print(path);
+        Serial.println(" ---");
+      } else {
+        Serial.print("--- ");
+        Serial.print(path);
+        Serial.print(" (");
+        Serial.print(file.size());
+        Serial.println(" bytes) ---");
 
-          uint8_t buffer[128];
-          while (file.available()) {
-            const size_t count = file.read(buffer, sizeof(buffer));
-            if (count == 0) {
-              break;
-            }
-            Serial.write(buffer, count);
-            delay(0);
+        uint8_t buffer[128];
+        while (file.available()) {
+          const size_t count = file.read(buffer, sizeof(buffer));
+          if (count == 0) {
+            break;
           }
-          file.close();
-          Serial.println();
+          Serial.write(buffer, count);
+          delay(0);
         }
+        file.close();
+        Serial.println();
       }
 
       if (sequence == UINT32_MAX) {
@@ -1106,26 +1125,21 @@ void clearLogs() {
          ++sequence) {
       char path[32];
       makeLogPath(sequence, path, sizeof(path));
-      if (LittleFS.exists(path)) {
-        LittleFS.remove(path);
-      }
+      LittleFS.remove(path);
       if (sequence == UINT32_MAX) {
         break;
       }
     }
   }
 
-  // Clean up files from the previous four-slot logger too.
+  // Clean up files from the previous four-slot logger too. remove() is safe
+  // for absent paths and avoids the noisy read-open performed by exists().
   for (uint8_t i = 0; i < 4; ++i) {
     char path[24];
     snprintf(path, sizeof(path), "/meshcore%u.log", i);
-    if (LittleFS.exists(path)) {
-      LittleFS.remove(path);
-    }
+    LittleFS.remove(path);
   }
-  if (LittleFS.exists(kLegacyLogStatePath)) {
-    LittleFS.remove(kLegacyLogStatePath);
-  }
+  LittleFS.remove(kLegacyLogStatePath);
 
   activeLogSequence = 0;
   oldestLogSequence = 0;
