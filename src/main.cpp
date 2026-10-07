@@ -15,10 +15,10 @@ constexpr int kPinMiso = 19;
 constexpr int kPinMosi = 23;
 constexpr int kPinCs = 5;
 
-// Core1262 control pins.
-constexpr int kPinReset = 26;
-constexpr int kPinBusy = 27;
-constexpr int kPinDio1 = 33;
+// Core1262 control pins. These match PINOUT.md.
+constexpr int kPinReset = 21;
+constexpr int kPinBusy = 2;
+constexpr int kPinDio1 = 15;
 constexpr int kPinRxEn = 22;
 constexpr int kPinTxEn = 4;
 
@@ -78,10 +78,11 @@ void setup() {
 
   SPI.begin(kPinSck, kPinMiso, kPinMosi, kPinCs);
 
-  // The Core1262 uses separate RXEN/TXEN signals for its onboard RF switch.
+  // Core1262 exposes separate RXEN and TXEN controls for its onboard RF switch.
+  // RadioLib drives RXEN high for receive and TXEN high for transmit.
   radio.setRfSwitchPins(kPinRxEn, kPinTxEn);
 
-  // DIO3 powers the onboard TCXO. It is wired internally on the Core1262.
+  // DIO3 controls the onboard TCXO and is wired internally on the Core1262.
   radio.tcxoVoltage = kTcxoVoltage;
 
   ConfigLoRa_t config;
