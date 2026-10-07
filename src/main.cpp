@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <AES.h>
 #include <RadioLib.h>
+#include <LittleFS.h>
 #include <SHA256.h>
 #include <SPI.h>
 
@@ -74,6 +75,13 @@ constexpr size_t kMaxMeshPathBytes = 64;
 constexpr size_t kCipherMacSize = 2;
 constexpr size_t kAesBlockSize = 16;
 
+// Persistent flash logging. Four rotating files bound storage use and leave
+// filesystem headroom for LittleFS metadata and future needs.
+constexpr uint8_t kLogFileCount = 4;
+constexpr size_t kPreferredLogFileBytes = 256 * 1024;
+constexpr char kLogStatePath[] = "/meshcore.state";
+constexpr size_t kSerialCommandBufferSize = 32;
+
 // MeshCore's documented default Public channel key.
 // The protocol's channel storage is 32 bytes. A 128-bit channel key occupies
 // the first 16 bytes and the remaining 16 bytes are zero.
@@ -95,6 +103,34 @@ SX1262 radio = new Module(
 volatile bool packetReceived = false;
 uint32_t packetCounter = 0;
 uint8_t publicChannelHash = 0;
+
+bool logStorageReady = false;
+uint8_t activeLogIndex = 0;
+size_t logFileLimitBytes = 0;
+File logFile;
+char serialCommandBuffer[kSerialCommandBufferSize] = {};
+size_t serialCommandLength = 0;
+
+class TeePrint : public Print {
+public:
+  TeePrint(Print& first, Print& second) : first_(first), second_(second) {}
+
+  size_t write(uint8_t value) override {
+    const size_t a = first_.write(value);
+    const size_t b = second_.write(value);
+    return (a == 1 && b == 1) ? 1 : 0;
+  }
+
+  size_t write(const uint8_t* buffer, size_t size) override {
+    const size_t a = first_.write(buffer, size);
+    const size_t b = second_.write(buffer, size);
+    return (a == size && b == size) ? size : 0;
+  }
+
+private:
+  Print& first_;
+  Print& second_;
+};
 
 struct MeshPacketView {
   uint8_t header = 0;
@@ -136,42 +172,42 @@ int32_t readLeI32(const uint8_t* p) {
   return static_cast<int32_t>(readLe32(p));
 }
 
-void printHexByte(uint8_t value) {
+void printHexByte(Print& out, uint8_t value) {
   static constexpr char kHex[] = "0123456789ABCDEF";
-  Serial.print(kHex[value >> 4]);
-  Serial.print(kHex[value & 0x0F]);
+  out.print(kHex[value >> 4]);
+  out.print(kHex[value & 0x0F]);
 }
 
-void printHex(const uint8_t* data, size_t length) {
+void printHex(Print& out, const uint8_t* data, size_t length) {
   for (size_t i = 0; i < length; ++i) {
-    printHexByte(data[i]);
+    printHexByte(out, data[i]);
   }
 }
 
-void printEscapedText(const uint8_t* data, size_t length) {
-  Serial.print('"');
+void printEscapedText(Print& out, const uint8_t* data, size_t length) {
+  out.print('"');
   for (size_t i = 0; i < length; ++i) {
     const uint8_t ch = data[i];
     if (ch == 0) {
       break;
     }
     if (ch == '\\' || ch == '"') {
-      Serial.print('\\');
-      Serial.print(static_cast<char>(ch));
+      out.print('\\');
+      out.print(static_cast<char>(ch));
     } else if (ch >= 0x20 && ch <= 0x7E) {
-      Serial.print(static_cast<char>(ch));
+      out.print(static_cast<char>(ch));
     } else if (ch == '\n') {
-      Serial.print("\\n");
+      out.print("\\n");
     } else if (ch == '\r') {
-      Serial.print("\\r");
+      out.print("\\r");
     } else if (ch == '\t') {
-      Serial.print("\\t");
+      out.print("\\t");
     } else {
-      Serial.print("\\x");
-      printHexByte(ch);
+      out.print("\\x");
+      printHexByte(out, ch);
     }
   }
-  Serial.print('"');
+  out.print('"');
 }
 
 const char* routeName(uint8_t routeType) {
@@ -315,7 +351,7 @@ int decryptPublicChannelPayload(
   return static_cast<int>(ciphertextLength);
 }
 
-void logPublicGroupText(const MeshPacketView& packet) {
+void logPublicGroupText(Print& out, const MeshPacketView& packet) {
   uint8_t plaintext[kMaxRadioPacket] = {};
   const int decryptedLength = decryptPublicChannelPayload(
       packet.payload,
@@ -324,20 +360,20 @@ void logPublicGroupText(const MeshPacketView& packet) {
       sizeof(plaintext));
 
   if (decryptedLength == 0) {
-    Serial.print("channel_hash=0x");
-    printHexByte(packet.payload[0]);
-    Serial.println(" encrypted=unknown-channel");
+    out.print("channel_hash=0x");
+    printHexByte(out, packet.payload[0]);
+    out.println(" encrypted=unknown-channel");
     return;
   }
 
   if (decryptedLength < 0) {
-    Serial.print("public_channel_decrypt=failed code=");
-    Serial.println(decryptedLength);
+    out.print("public_channel_decrypt=failed code=");
+    out.println(decryptedLength);
     return;
   }
 
   if (decryptedLength < 5) {
-    Serial.println("public_channel_decrypt=malformed");
+    out.println("public_channel_decrypt=malformed");
     return;
   }
 
@@ -351,23 +387,23 @@ void logPublicGroupText(const MeshPacketView& packet) {
     --textLength;
   }
 
-  Serial.print("PUBLIC timestamp=");
-  Serial.print(timestamp);
-  Serial.print(" text_type=");
-  Serial.print(textType);
-  Serial.print(" attempt=");
-  Serial.print(attempt);
-  Serial.print(" text=");
-  printEscapedText(&plaintext[5], textLength);
-  Serial.println();
+  out.print("PUBLIC timestamp=");
+  out.print(timestamp);
+  out.print(" text_type=");
+  out.print(textType);
+  out.print(" attempt=");
+  out.print(attempt);
+  out.print(" text=");
+  printEscapedText(out, &plaintext[5], textLength);
+  out.println();
 
   if (textType == 0) {
-    Serial.println(
+    out.println(
         "note=MeshCore group sender names are unverified message text");
   }
 }
 
-void logPublicGroupData(const MeshPacketView& packet) {
+void logPublicGroupData(Print& out, const MeshPacketView& packet) {
   uint8_t plaintext[kMaxRadioPacket] = {};
   const int decryptedLength = decryptPublicChannelPayload(
       packet.payload,
@@ -376,15 +412,15 @@ void logPublicGroupData(const MeshPacketView& packet) {
       sizeof(plaintext));
 
   if (decryptedLength == 0) {
-    Serial.print("channel_hash=0x");
-    printHexByte(packet.payload[0]);
-    Serial.println(" encrypted=unknown-channel");
+    out.print("channel_hash=0x");
+    printHexByte(out, packet.payload[0]);
+    out.println(" encrypted=unknown-channel");
     return;
   }
 
   if (decryptedLength < 3) {
-    Serial.print("public_group_data_decrypt=failed code=");
-    Serial.println(decryptedLength);
+    out.print("public_group_data_decrypt=failed code=");
+    out.println(decryptedLength);
     return;
   }
 
@@ -395,21 +431,21 @@ void logPublicGroupData(const MeshPacketView& packet) {
   const size_t dataLength =
       min(static_cast<size_t>(declaredLength), availableLength);
 
-  Serial.print("PUBLIC_DATA type=0x");
-  printHexByte(static_cast<uint8_t>(dataType >> 8));
-  printHexByte(static_cast<uint8_t>(dataType & 0xFF));
-  Serial.print(" len=");
-  Serial.print(dataLength);
-  Serial.print(" data=");
-  printHex(&plaintext[3], dataLength);
-  Serial.println();
+  out.print("PUBLIC_DATA type=0x");
+  printHexByte(out, static_cast<uint8_t>(dataType >> 8));
+  printHexByte(out, static_cast<uint8_t>(dataType & 0xFF));
+  out.print(" len=");
+  out.print(dataLength);
+  out.print(" data=");
+  printHex(out, &plaintext[3], dataLength);
+  out.println();
 }
 
-void logAdvert(const MeshPacketView& packet) {
+void logAdvert(Print& out, const MeshPacketView& packet) {
   // public key (32) + timestamp (4) + Ed25519 signature (64)
   constexpr size_t kAdvertFixedLength = 32 + 4 + 64;
   if (packet.payloadLength < kAdvertFixedLength) {
-    Serial.println("advert=malformed");
+    out.println("advert=malformed");
     return;
   }
 
@@ -419,11 +455,11 @@ void logAdvert(const MeshPacketView& packet) {
   const size_t appDataLength =
       packet.payloadLength - kAdvertFixedLength;
 
-  Serial.print("ADVERT timestamp=");
-  Serial.print(timestamp);
-  Serial.print(" pubkey_prefix=");
-  printHex(publicKey, 8);
-  Serial.println(" signature=not-verified");
+  out.print("ADVERT timestamp=");
+  out.print(timestamp);
+  out.print(" pubkey_prefix=");
+  printHex(out, publicKey, 8);
+  out.println(" signature=not-verified");
 
   if (appDataLength == 0) {
     return;
@@ -433,14 +469,14 @@ void logAdvert(const MeshPacketView& packet) {
   const uint8_t nodeType = flags & 0x0F;
   size_t offset = 1;
 
-  Serial.print("advert_type=");
-  Serial.print(nodeType);
-  Serial.print(" flags=0x");
-  printHexByte(flags);
+  out.print("advert_type=");
+  out.print(nodeType);
+  out.print(" flags=0x");
+  printHexByte(out, flags);
 
   if (flags & 0x10) {
     if (offset + 8 > appDataLength) {
-      Serial.println(" appdata=malformed");
+      out.println(" appdata=malformed");
       return;
     }
     const int32_t latitude = readLeI32(&appData[offset]);
@@ -448,91 +484,91 @@ void logAdvert(const MeshPacketView& packet) {
     const int32_t longitude = readLeI32(&appData[offset]);
     offset += 4;
 
-    Serial.print(" lat=");
-    Serial.print(latitude / 1000000.0, 6);
-    Serial.print(" lon=");
-    Serial.print(longitude / 1000000.0, 6);
+    out.print(" lat=");
+    out.print(latitude / 1000000.0, 6);
+    out.print(" lon=");
+    out.print(longitude / 1000000.0, 6);
   }
 
   if (flags & 0x20) {
     if (offset + 2 > appDataLength) {
-      Serial.println(" appdata=malformed");
+      out.println(" appdata=malformed");
       return;
     }
-    Serial.print(" feature1=0x");
-    printHexByte(appData[offset + 1]);
-    printHexByte(appData[offset]);
+    out.print(" feature1=0x");
+    printHexByte(out, appData[offset + 1]);
+    printHexByte(out, appData[offset]);
     offset += 2;
   }
 
   if (flags & 0x40) {
     if (offset + 2 > appDataLength) {
-      Serial.println(" appdata=malformed");
+      out.println(" appdata=malformed");
       return;
     }
-    Serial.print(" feature2=0x");
-    printHexByte(appData[offset + 1]);
-    printHexByte(appData[offset]);
+    out.print(" feature2=0x");
+    printHexByte(out, appData[offset + 1]);
+    printHexByte(out, appData[offset]);
     offset += 2;
   }
 
   if ((flags & 0x80) && offset < appDataLength) {
-    Serial.print(" name=");
-    printEscapedText(&appData[offset], appDataLength - offset);
+    out.print(" name=");
+    printEscapedText(out, &appData[offset], appDataLength - offset);
   }
 
-  Serial.println();
+  out.println();
 }
 
-void logMeshPacket(const uint8_t* data, size_t length) {
+void logMeshPacket(Print& out, const uint8_t* data, size_t length) {
   MeshPacketView packet;
   if (!parseMeshPacket(data, length, packet)) {
-    Serial.println("mesh_parse=invalid");
+    out.println("mesh_parse=invalid");
     return;
   }
 
-  Serial.print("mesh_version=");
-  Serial.print(packet.payloadVersion + 1);
-  Serial.print(" route=");
-  Serial.print(routeName(packet.routeType));
-  Serial.print(" payload=");
-  Serial.print(payloadName(packet.payloadType));
-  Serial.print("(");
-  Serial.print(packet.payloadType);
-  Serial.print(")");
-  Serial.print(" hops=");
-  Serial.print(packet.pathHashCount);
-  Serial.print(" path_hash_bytes=");
-  Serial.print(packet.pathHashSize);
+  out.print("mesh_version=");
+  out.print(packet.payloadVersion + 1);
+  out.print(" route=");
+  out.print(routeName(packet.routeType));
+  out.print(" payload=");
+  out.print(payloadName(packet.payloadType));
+  out.print("(");
+  out.print(packet.payloadType);
+  out.print(")");
+  out.print(" hops=");
+  out.print(packet.pathHashCount);
+  out.print(" path_hash_bytes=");
+  out.print(packet.pathHashSize);
 
   if (packet.hasTransportCodes) {
-    Serial.print(" transport=0x");
-    printHexByte(static_cast<uint8_t>(packet.transportCode1 >> 8));
-    printHexByte(static_cast<uint8_t>(packet.transportCode1 & 0xFF));
-    Serial.print(",0x");
-    printHexByte(static_cast<uint8_t>(packet.transportCode2 >> 8));
-    printHexByte(static_cast<uint8_t>(packet.transportCode2 & 0xFF));
+    out.print(" transport=0x");
+    printHexByte(out, static_cast<uint8_t>(packet.transportCode1 >> 8));
+    printHexByte(out, static_cast<uint8_t>(packet.transportCode1 & 0xFF));
+    out.print(",0x");
+    printHexByte(out, static_cast<uint8_t>(packet.transportCode2 >> 8));
+    printHexByte(out, static_cast<uint8_t>(packet.transportCode2 & 0xFF));
   }
 
-  Serial.println();
+  out.println();
 
   if (packet.pathBytes > 0) {
-    Serial.print("path=");
-    printHex(packet.path, packet.pathBytes);
-    Serial.println();
+    out.print("path=");
+    printHex(out, packet.path, packet.pathBytes);
+    out.println();
   }
 
   switch (packet.payloadType) {
     case kPayloadGroupText:
-      logPublicGroupText(packet);
+      logPublicGroupText(out, packet);
       break;
 
     case kPayloadGroupData:
-      logPublicGroupData(packet);
+      logPublicGroupData(out, packet);
       break;
 
     case kPayloadAdvert:
-      logAdvert(packet);
+      logAdvert(out, packet);
       break;
 
     case kPayloadText:
@@ -540,15 +576,15 @@ void logMeshPacket(const uint8_t* data, size_t length) {
     case kPayloadResponse:
     case kPayloadAnonReq:
     case kPayloadPath:
-      Serial.println(
+      out.println(
           "content=encrypted-private-or-peer-specific");
       break;
 
     case kPayloadControl:
       if (packet.payloadLength > 0) {
-        Serial.print("control_subtype=0x");
-        printHexByte(packet.payload[0] >> 4);
-        Serial.println();
+        out.print("control_subtype=0x");
+        printHexByte(out, packet.payload[0] >> 4);
+        out.println();
       }
       break;
 
@@ -557,7 +593,11 @@ void logMeshPacket(const uint8_t* data, size_t length) {
   }
 }
 
-void logReceivedPacket(uint8_t* data, size_t length, int state) {
+void logReceivedPacket(
+    Print& out,
+    uint8_t* data,
+    size_t length,
+    int state) {
   ++packetCounter;
 
   const float rssi = radio.getRSSI();
@@ -569,52 +609,356 @@ void logReceivedPacket(uint8_t* data, size_t length, int state) {
   const int headerState =
       radio.getLoRaRxHeaderInfo(&rxCodingRate, &rxHasCrc);
 
-  Serial.println();
-  Serial.print("=== RX #");
-  Serial.print(packetCounter);
-  Serial.println(" ===");
+  out.println();
+  out.print("=== RX #");
+  out.print(packetCounter);
+  out.println(" ===");
 
-  Serial.print("millis=");
-  Serial.print(millis());
-  Serial.print(" len=");
-  Serial.print(length);
-  Serial.print(" rssi_dbm=");
-  Serial.print(rssi, 1);
-  Serial.print(" snr_db=");
-  Serial.print(snr, 2);
-  Serial.print(" freq_error_hz=");
-  Serial.print(frequencyError, 1);
+  out.print("millis=");
+  out.print(millis());
+  out.print(" len=");
+  out.print(length);
+  out.print(" rssi_dbm=");
+  out.print(rssi, 1);
+  out.print(" snr_db=");
+  out.print(snr, 2);
+  out.print(" freq_error_hz=");
+  out.print(frequencyError, 1);
 
   if (headerState == RADIOLIB_ERR_NONE) {
-    Serial.print(" rx_cr=");
+    out.print(" rx_cr=");
     if (rxCodingRate >= 1 && rxCodingRate <= 4) {
-      Serial.print("4/");
-      Serial.print(rxCodingRate + 4);
+      out.print("4/");
+      out.print(rxCodingRate + 4);
     } else {
-      Serial.print("raw:");
-      Serial.print(rxCodingRate);
+      out.print("raw:");
+      out.print(rxCodingRate);
     }
-    Serial.print(" crc=");
-    Serial.print(rxHasCrc ? "yes" : "no");
+    out.print(" crc=");
+    out.print(rxHasCrc ? "yes" : "no");
   }
-  Serial.println();
+  out.println();
 
-  Serial.print("raw=");
-  printHex(data, length);
-  Serial.println();
+  out.print("raw=");
+  printHex(out, data, length);
+  out.println();
 
   if (state == RADIOLIB_ERR_CRC_MISMATCH) {
-    Serial.println("radio_crc=FAILED mesh_parse=skipped");
+    out.println("radio_crc=FAILED mesh_parse=skipped");
     return;
   }
 
   if (state != RADIOLIB_ERR_NONE) {
-    Serial.print("radio_read_error=");
-    Serial.println(state);
+    out.print("radio_read_error=");
+    out.println(state);
     return;
   }
 
-  logMeshPacket(data, length);
+  logMeshPacket(out, data, length);
+}
+
+void makeLogPath(uint8_t index, char* path, size_t pathSize) {
+  snprintf(path, pathSize, "/meshcore%u.log", index);
+}
+
+bool saveLogState() {
+  File state = LittleFS.open(kLogStatePath, FILE_WRITE);
+  if (!state) {
+    return false;
+  }
+  state.print(activeLogIndex);
+  state.close();
+  return true;
+}
+
+void loadLogState() {
+  activeLogIndex = 0;
+  File state = LittleFS.open(kLogStatePath, FILE_READ);
+  if (!state) {
+    return;
+  }
+
+  const int value = state.read();
+  state.close();
+  if (value >= '0' && value < '0' + kLogFileCount) {
+    activeLogIndex = static_cast<uint8_t>(value - '0');
+  }
+}
+
+bool openActiveLogFile() {
+  char path[24];
+  makeLogPath(activeLogIndex, path, sizeof(path));
+  logFile = LittleFS.open(path, FILE_APPEND);
+  return static_cast<bool>(logFile);
+}
+
+bool rotateLogIfNeeded() {
+  if (!logStorageReady || !logFile) {
+    return false;
+  }
+
+  if (logFile.size() < logFileLimitBytes) {
+    return true;
+  }
+
+  logFile.flush();
+  logFile.close();
+
+  activeLogIndex = (activeLogIndex + 1) % kLogFileCount;
+
+  char path[24];
+  makeLogPath(activeLogIndex, path, sizeof(path));
+  if (LittleFS.exists(path)) {
+    LittleFS.remove(path);
+  }
+
+  if (!openActiveLogFile()) {
+    logStorageReady = false;
+    Serial.println("Persistent logging disabled: log rotation failed.");
+    return false;
+  }
+
+  if (!saveLogState()) {
+    Serial.println("Warning: could not save log rotation state.");
+  }
+
+  logFile.println();
+  logFile.println("=== LOG ROTATED ===");
+  logFile.flush();
+  return true;
+}
+
+void writeBootLogHeader() {
+  if (!logStorageReady || !logFile) {
+    return;
+  }
+
+  logFile.println();
+  logFile.println("=== BOOT ===");
+  logFile.print("profile freq_mhz=");
+  logFile.print(kFrequencyMHz, 3);
+  logFile.print(" bw_khz=");
+  logFile.print(kBandwidthKHz, 1);
+  logFile.print(" sf=");
+  logFile.print(kSpreadingFactor);
+  logFile.print(" cr=4/");
+  logFile.print(kCodingRate);
+  logFile.print(" preamble=");
+  logFile.println(kPreambleLength);
+  logFile.flush();
+}
+
+void beginLogStorage() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed. Persistent logging disabled.");
+    return;
+  }
+
+  const size_t totalBytes = LittleFS.totalBytes();
+  const size_t dynamicLimit =
+      totalBytes > 0 ? totalBytes / (kLogFileCount + 1) : 0;
+  logFileLimitBytes =
+      (dynamicLimit > 0 && dynamicLimit < kPreferredLogFileBytes)
+          ? dynamicLimit
+          : kPreferredLogFileBytes;
+
+  loadLogState();
+
+  if (!openActiveLogFile()) {
+    Serial.println("Could not open persistent log file.");
+    return;
+  }
+
+  logStorageReady = true;
+  saveLogState();
+
+  Serial.print("LittleFS logging enabled: ");
+  Serial.print(LittleFS.usedBytes());
+  Serial.print("/");
+  Serial.print(LittleFS.totalBytes());
+  Serial.print(" bytes used, ");
+  Serial.print(kLogFileCount);
+  Serial.print(" files x ");
+  Serial.print(logFileLimitBytes);
+  Serial.println(" bytes max");
+
+  writeBootLogHeader();
+}
+
+void printLogInfo() {
+  if (!logStorageReady) {
+    Serial.println("Persistent logging is not available.");
+    return;
+  }
+
+  if (logFile) {
+    logFile.flush();
+  }
+
+  Serial.print("LittleFS total=");
+  Serial.print(LittleFS.totalBytes());
+  Serial.print(" used=");
+  Serial.print(LittleFS.usedBytes());
+  Serial.print(" per_file_limit=");
+  Serial.println(logFileLimitBytes);
+
+  for (uint8_t i = 0; i < kLogFileCount; ++i) {
+    char path[24];
+    makeLogPath(i, path, sizeof(path));
+
+    Serial.print(path);
+    if (LittleFS.exists(path)) {
+      File file = LittleFS.open(path, FILE_READ);
+      Serial.print(" size=");
+      Serial.print(file ? file.size() : 0);
+      if (file) {
+        file.close();
+      }
+    } else {
+      Serial.print(" missing");
+    }
+
+    if (i == activeLogIndex) {
+      Serial.print(" active");
+    }
+    Serial.println();
+  }
+}
+
+void dumpLogs() {
+  if (!logStorageReady) {
+    Serial.println("Persistent logging is not available.");
+    return;
+  }
+
+  if (logFile) {
+    logFile.flush();
+  }
+
+  Serial.println("=== LOG DUMP BEGIN ===");
+
+  // Oldest file is immediately after the active file in the ring. Missing
+  // files are skipped, so this also works before all four slots are used.
+  for (uint8_t offset = 1; offset <= kLogFileCount; ++offset) {
+    const uint8_t index =
+        (activeLogIndex + offset) % kLogFileCount;
+    char path[24];
+    makeLogPath(index, path, sizeof(path));
+
+    if (!LittleFS.exists(path)) {
+      continue;
+    }
+
+    File file = LittleFS.open(path, FILE_READ);
+    if (!file) {
+      Serial.print("--- failed to open ");
+      Serial.print(path);
+      Serial.println(" ---");
+      continue;
+    }
+
+    Serial.print("--- ");
+    Serial.print(path);
+    Serial.print(" (");
+    Serial.print(file.size());
+    Serial.println(" bytes) ---");
+
+    uint8_t buffer[128];
+    while (file.available()) {
+      const size_t count = file.read(buffer, sizeof(buffer));
+      if (count == 0) {
+        break;
+      }
+      Serial.write(buffer, count);
+      delay(0);
+    }
+    file.close();
+
+    if (Serial.availableForWrite() > 0) {
+      Serial.println();
+    }
+  }
+
+  Serial.println("=== LOG DUMP END ===");
+}
+
+void clearLogs() {
+  if (!logStorageReady) {
+    Serial.println("Persistent logging is not available.");
+    return;
+  }
+
+  if (logFile) {
+    logFile.close();
+  }
+
+  for (uint8_t i = 0; i < kLogFileCount; ++i) {
+    char path[24];
+    makeLogPath(i, path, sizeof(path));
+    if (LittleFS.exists(path)) {
+      LittleFS.remove(path);
+    }
+  }
+
+  if (LittleFS.exists(kLogStatePath)) {
+    LittleFS.remove(kLogStatePath);
+  }
+
+  activeLogIndex = 0;
+  if (!openActiveLogFile()) {
+    logStorageReady = false;
+    Serial.println("Logs cleared, but the active log could not be reopened.");
+    return;
+  }
+
+  saveLogState();
+  writeBootLogHeader();
+  Serial.println("Persistent logs cleared.");
+}
+
+void printSerialHelp() {
+  Serial.println("Serial commands:");
+  Serial.println("  logs      - dump stored logs oldest to newest");
+  Serial.println("  loginfo   - show filesystem and log file usage");
+  Serial.println("  clearlogs - erase stored MeshCore logs");
+  Serial.println("  help      - show this help");
+}
+
+void executeSerialCommand(const char* command) {
+  if (strcmp(command, "logs") == 0 || strcmp(command, "dump") == 0) {
+    dumpLogs();
+  } else if (strcmp(command, "loginfo") == 0) {
+    printLogInfo();
+  } else if (strcmp(command, "clearlogs") == 0) {
+    clearLogs();
+  } else if (strcmp(command, "help") == 0 || strcmp(command, "?") == 0) {
+    printSerialHelp();
+  } else if (command[0] != '\0') {
+    Serial.print("Unknown command: ");
+    Serial.println(command);
+    printSerialHelp();
+  }
+}
+
+void handleSerialCommands() {
+  while (Serial.available() > 0) {
+    const char ch = static_cast<char>(Serial.read());
+
+    if (ch == '\r') {
+      continue;
+    }
+
+    if (ch == '\n') {
+      serialCommandBuffer[serialCommandLength] = '\0';
+      executeSerialCommand(serialCommandBuffer);
+      serialCommandLength = 0;
+      continue;
+    }
+
+    if (serialCommandLength + 1 < kSerialCommandBufferSize) {
+      serialCommandBuffer[serialCommandLength++] = ch;
+    }
+  }
 }
 
 void haltOnError(const char* operation, int state) {
@@ -652,8 +996,10 @@ void setup() {
 
   computePublicChannelHash();
   Serial.print("MeshCore Public channel hash: 0x");
-  printHexByte(publicChannelHash);
+  printHexByte(Serial, publicChannelHash);
   Serial.println();
+
+  beginLogStorage();
 
   radioSpi.begin(kPinSck, kPinMiso, kPinMosi, kPinCs);
 
@@ -689,9 +1035,12 @@ void setup() {
   }
   Serial.println("SUCCESS");
   Serial.println("Listener is passive. It will not transmit or forward packets.");
+  printSerialHelp();
 }
 
 void loop() {
+  handleSerialCommands();
+
   if (!packetReceived) {
     delay(5);
     return;
@@ -708,5 +1057,12 @@ void loop() {
 
   uint8_t buffer[kMaxRadioPacket] = {};
   const int state = radio.readData(buffer, packetLength);
-  logReceivedPacket(buffer, packetLength, state);
+
+  if (rotateLogIfNeeded() && logFile) {
+    TeePrint output(Serial, logFile);
+    logReceivedPacket(output, buffer, packetLength, state);
+    logFile.flush();
+  } else {
+    logReceivedPacket(Serial, buffer, packetLength, state);
+  }
 }
