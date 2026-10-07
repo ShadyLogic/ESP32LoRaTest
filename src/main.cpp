@@ -864,7 +864,7 @@ bool deleteOldestClosedLog() {
 
   char path[32];
   makeLogPath(oldestLogSequence, path, sizeof(path));
-  if (!LittleFS.exists(path) || !LittleFS.remove(path)) {
+  if (!LittleFS.remove(path)) {
     return false;
   }
 
@@ -912,9 +912,9 @@ bool rotateLogIfNeeded() {
   char path[32];
   makeLogPath(activeLogSequence, path, sizeof(path));
 
-  if (LittleFS.exists(path)) {
-    LittleFS.remove(path);
-  }
+  // Sequence numbers are monotonic, so this path should be new. Remove it
+  // defensively without probing first to avoid noisy VFS read-open errors.
+  LittleFS.remove(path);
 
   logFile = LittleFS.open(path, FILE_WRITE);
   if (!logFile) {
@@ -1034,12 +1034,6 @@ void printLogInfo() {
        ++sequence) {
     char path[32];
     makeLogPath(sequence, path, sizeof(path));
-    if (!LittleFS.exists(path)) {
-      if (sequence == UINT32_MAX) {
-        break;
-      }
-      continue;
-    }
 
     File file = LittleFS.open(path, FILE_READ);
     Serial.print(path);
@@ -1080,31 +1074,29 @@ void dumpLogs() {
       char path[32];
       makeLogPath(sequence, path, sizeof(path));
 
-      if (LittleFS.exists(path)) {
-        File file = LittleFS.open(path, FILE_READ);
-        if (!file) {
-          Serial.print("--- failed to open ");
-          Serial.print(path);
-          Serial.println(" ---");
-        } else {
-          Serial.print("--- ");
-          Serial.print(path);
-          Serial.print(" (");
-          Serial.print(file.size());
-          Serial.println(" bytes) ---");
+      File file = LittleFS.open(path, FILE_READ);
+      if (!file) {
+        Serial.print("--- failed to open ");
+        Serial.print(path);
+        Serial.println(" ---");
+      } else {
+        Serial.print("--- ");
+        Serial.print(path);
+        Serial.print(" (");
+        Serial.print(file.size());
+        Serial.println(" bytes) ---");
 
-          uint8_t buffer[128];
-          while (file.available()) {
-            const size_t count = file.read(buffer, sizeof(buffer));
-            if (count == 0) {
-              break;
-            }
-            Serial.write(buffer, count);
-            delay(0);
+        uint8_t buffer[128];
+        while (file.available()) {
+          const size_t count = file.read(buffer, sizeof(buffer));
+          if (count == 0) {
+            break;
           }
-          file.close();
-          Serial.println();
+          Serial.write(buffer, count);
+          delay(0);
         }
+        file.close();
+        Serial.println();
       }
 
       if (sequence == UINT32_MAX) {
@@ -1133,9 +1125,7 @@ void clearLogs() {
          ++sequence) {
       char path[32];
       makeLogPath(sequence, path, sizeof(path));
-      if (LittleFS.exists(path)) {
-        LittleFS.remove(path);
-      }
+      LittleFS.remove(path);
       if (sequence == UINT32_MAX) {
         break;
       }
